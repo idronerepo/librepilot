@@ -67,6 +67,7 @@
 
 #include <mathmisc.h>
 #include <taskinfo.h>
+#include <pios_config.h>
 #include <pios_math.h>
 #include <pios_constants.h>
 #include <CoordinateConversions.h>
@@ -74,7 +75,8 @@
 #include <string.h>
 
 // Private constants
-#define STACK_SIZE_BYTES         1000
+
+#define STACK_SIZE_BYTES         1024
 #define TASK_PRIORITY            (tskIDLE_PRIORITY + 3)
 
 #define MAX_SENSORS_PER_INSTANCE 2
@@ -156,6 +158,12 @@ static void updateAccelTempBias(float temperature);
 static void updateGyroTempBias(float temperature);
 static void updateBaroTempBias(float temperature);
 
+#if PIOS_INCLUDE_IS
+
+static void processSensorsInertialSense(void);
+
+#endif
+
 // Private variables
 static sensor_data *source_data;
 static xTaskHandle sensorsTaskHandle;
@@ -196,6 +204,135 @@ static uint8_t baro_temp_calibration_count = 0;
 // Allow AuxMag to be disabled without reboot
 // because the other mags are that way
 static bool useAuxMag = false;
+#endif
+
+// this should be defined in the firmware makefile, i.e. flight/targets/boards/revolution/firmware (USE_INERTIAL_SENSE = YES)
+#if PIOS_INCLUDE_IS
+
+#include "com_manager.h"
+#include "data_sets.h"
+
+#ifdef PIOS_GPS_SETS_HOMELOCATION
+
+#include "GPS.h"
+#include "WorldMagModel.h"
+
+static float GravityAccel(float latitude, __attribute__((unused)) float longitude, float altitude)
+{
+    /* WGS84 gravity model.  The effect of gravity over latitude is strong
+     * enough to change the estimated accelerometer bias in those apps. */
+    float sinsq = sinf(latitude);
+    
+    sinsq *= sinsq;
+    /* Likewise, over the altitude range of a high-altitude balloon, the effect
+     * due to change in altitude can also affect the model. */
+    return 9.7803267714f * (1.0f + 0.00193185138639f * sinsq) / sqrtf(1.0f - 0.00669437999013f * sinsq)
+    - 3.086e-6f * altitude;
+}
+
+#endif
+
+static int writeInertialSensePacket(CMHANDLE cmHandle, int pHandle, buffer_t* packet)
+{
+    // Suppress compiler warnings
+    (void)pHandle;
+    (void)cmHandle;
+    
+    return PIOS_COM_SendBuffer(PIOS_COM_IS, packet->buf, packet->size);
+}
+
+static int readInertialSensePacket(CMHANDLE cmHandle, int pHandle, unsigned char* buf, int len)
+{
+    // Suppress compiler warnings
+    (void)pHandle;
+    (void)cmHandle;
+    
+    return PIOS_COM_ReceiveBuffer(PIOS_COM_IS, buf, len, 20);
+}
+
+static void processInertialSensePacket(CMHANDLE cmHandle, int pHandle, p_data_t* data)
+{
+    (void)pHandle;
+    (void)cmHandle;
+    (void)data;
+    
+    if (data->hdr.id == DID_GPS)
+    {
+        
+#ifdef PIOS_GPS_SETS_HOMELOCATION
+        
+        gps_t* gps = (gps_t*)data;
+        
+#ifdef PIOS_GPS_SETS_HOMELOCATION
+        
+        // TODO: this really fouls things up, need to figure out what is going on
+        //        gps_t* gps = (gps_t*)data;
+        
+        //        int32_t lat = gps->pos.lla[0] * 1000000;
+        //        int32_t lon = gps->pos.lla[1] * 1000000;
+        //        float alt = gps->pos.lla[2];
+        
+        //        HomeLocationLatitudeSet(&lat);
+        //        HomeLocationLongitudeSet(&lon);
+        //        HomeLocationAltitudeSet(&alt);
+        
+#endif
+        
+        /* Store LLA */
+        HomeLocationData home;
+        HomeLocationGet(&home);
+        home.Latitude  = (float)gps->pos.lla[0];
+        home.Longitude = (float)gps->pos.lla[1];
+        home.Altitude  = (float)gps->pos.lla[2] + (float)gps->pos.hMSL;
+        
+        /* Compute home ECEF coordinates and the rotation matrix into NED
+         * Note that floats are used here - they should give enough precision
+         * for this application.*/
+        
+        float LLA[3] = { (home.Latitude) / 10e6f, (home.Longitude) / 10e6f, (home.Altitude) };
+
+        // TODO: Need month, day and year from uINS
+        
+        /* Compute magnetic flux direction at home location */
+        if (WMM_GetMagVector(LLA[0], LLA[1], LLA[2], 7, 4, 2016, &home.Be[0]) == 0)
+        {
+            /*Compute local acceleration due to gravity.  Vehicles that span a very large
+             * range of altitude (say, weather balloons) may need to update this during the flight. */
+            home.g_e = GravityAccel(LLA[0], LLA[1], LLA[2]);
+            home.Set = HOMELOCATION_SET_TRUE;
+//            HomeLocationSet(&home);
+        }
+        
+#endif
+        
+    }
+    else if (data->hdr.id == DID_SYS_SENSORS)
+    {
+        sys_sensors_t* sysSensors = (sys_sensors_t*)data->buf;
+        {
+            AccelSensorData accelSensorData = { sysSensors->acc[0], sysSensors->acc[1], sysSensors->acc[2], sysSensors->temp };
+            AccelSensorSet(&accelSensorData);
+        }
+        {
+            GyroSensorData gyroSensorData = { RAD2DEG(sysSensors->pqr[0]), RAD2DEG(sysSensors->pqr[1]), RAD2DEG(sysSensors->pqr[2]), sysSensors->temp };
+            GyroSensorSet(&gyroSensorData);
+        }
+        {
+            MagSensorData magSensorData = { sysSensors->mag[0], sysSensors->mag[1], sysSensors->mag[2], sysSensors->temp };
+            MagSensorSet(&magSensorData);
+        }
+        {
+            float altitude = 44330.0f * (1.0f - powf((sysSensors->bar) / PIOS_CONST_MKS_STD_ATMOSPHERE_F, (1.0f / 5.255f)));
+            
+            if (!isnan(altitude))
+            {
+                BaroSensorData baroData = { altitude, sysSensors->temp, sysSensors->bar };
+                BaroSensorSet(&baroData);
+            }
+        }
+    }
+}
+
 #endif
 
 /**
@@ -298,53 +435,76 @@ static void SensorsTask(__attribute__((unused)) void *parameters)
     uint32_t reset_counter = 0;
 
     while (1) {
+        
         // TODO: add timeouts to the sensor reads and set an error if the fail
-        if (error) {
+        if (error)
+        {
             RELOAD_WDG();
             lastSysTime = xTaskGetTickCount();
             vTaskDelayUntil(&lastSysTime, sensor_period_ticks);
             AlarmsSet(SYSTEMALARMS_ALARM_SENSORS, SYSTEMALARMS_ALARM_CRITICAL);
             error = false;
-        } else {
+        }
+        else
+        {
             AlarmsClear(SYSTEMALARMS_ALARM_SENSORS);
         }
-
-
+        
         // reset the fetch context
         clearContext(&sensor_context);
-        LL_FOREACH((PIOS_SENSORS_Instance *)sensors_list, sensor) {
-            // we will wait on the sensor that's marked as primary( that means the sensor with higher sample rate)
-            bool is_primary = (sensor->type & PIOS_SENSORS_TYPE_3AXIS_ACCEL);
 
-            if (!sensor->driver->is_polled) {
-                const QueueHandle_t queue = PIOS_SENSORS_GetQueue(sensor);
-                while (xQueueReceive(queue,
-                                     (void *)source_data,
-                                     (is_primary && !sensor_context.count) ? sensor_period_ticks : 0) == pdTRUE) {
-                    accumulateSamples(&sensor_context, source_data);
-                }
-                if (sensor_context.count) {
-                    processSamples3d(&sensor_context, sensor);
-                    clearContext(&sensor_context);
-                } else if (is_primary) {
-                    PIOS_SENSOR_Reset(sensor);
-                    reset_counter++;
-                    PERF_TRACK_VALUE(counterSensorResets, reset_counter);
-                    error = true;
-                }
-            } else {
-                if (PIOS_SENSORS_Poll(sensor)) {
-                    PIOS_SENSOR_Fetch(sensor, (void *)source_data, MAX_SENSORS_PER_INSTANCE);
-                    if (sensor->type & PIOS_SENSORS_TYPE_3D) {
+#if PIOS_INCLUDE_IS
+        
+        if (PIOS_COM_IS)
+        {
+            processSensorsInertialSense();
+        }
+        else
+        {
+            
+#endif
+
+            LL_FOREACH((PIOS_SENSORS_Instance *)sensors_list, sensor)
+            {
+                // we will wait on the sensor that's marked as primary( that means the sensor with higher sample rate)
+                bool is_primary = (sensor->type & PIOS_SENSORS_TYPE_3AXIS_ACCEL);
+
+                if (!sensor->driver->is_polled) {
+                    const QueueHandle_t queue = PIOS_SENSORS_GetQueue(sensor);
+                    while (xQueueReceive(queue,
+                                         (void *)source_data,
+                                         (is_primary && !sensor_context.count) ? sensor_period_ticks : 0) == pdTRUE) {
                         accumulateSamples(&sensor_context, source_data);
-                        processSamples3d(&sensor_context, sensor);
-                    } else {
-                        processSamples1d(&source_data->sensorSample1Axis, sensor);
                     }
-                    clearContext(&sensor_context);
+                    if (sensor_context.count) {
+                        processSamples3d(&sensor_context, sensor);
+                        clearContext(&sensor_context);
+                    } else if (is_primary) {
+                        PIOS_SENSOR_Reset(sensor);
+                        reset_counter++;
+                        PERF_TRACK_VALUE(counterSensorResets, reset_counter);
+                        error = true;
+                    }
+                } else {
+                    if (PIOS_SENSORS_Poll(sensor)) {
+                        PIOS_SENSOR_Fetch(sensor, (void *)source_data, MAX_SENSORS_PER_INSTANCE);
+                        if (sensor->type & PIOS_SENSORS_TYPE_3D) {
+                            accumulateSamples(&sensor_context, source_data);
+                            processSamples3d(&sensor_context, sensor);
+                        } else {
+                            processSamples1d(&source_data->sensorSample1Axis, sensor);
+                        }
+                        clearContext(&sensor_context);
+                    }
                 }
             }
+            
+#if PIOS_INCLUDE_IS
+            
         }
+        
+#endif
+            
         PERF_MEASURE_PERIOD(counterSensorPeriod);
         RELOAD_WDG();
         vTaskDelayUntil(&lastSysTime, sensor_period_ticks);
@@ -645,6 +805,40 @@ void aux_hmc5x83_load_mag_settings()
     }
 }
 #endif
+
+#if PIOS_INCLUDE_IS
+
+static void processSensorsInertialSense(void)
+{
+    static char isInitialized = 0;
+    
+    if (!isInitialized)
+    {
+        // initialize Inertial Sense
+        isInitialized = 1;
+        
+        // set baud rate
+        PIOS_COM_ChangeBaud(PIOS_COM_IS, 115200);
+        
+        // setup com manager
+        initComManager(1, 0, sensor_period_ticks, 0, readInertialSensePacket, writeInertialSensePacket, 0, processInertialSensePacket, 0, 0);
+        
+        // request device info 10 time a second (sys_sensors_t)
+        getDataComManager(0, DID_SYS_SENSORS, 0, 0, 100);
+    
+        // request gps data 5 times a second (gps_nav_poslla_t)
+        getDataComManager(0, DID_GPS, 0, 0, 200);
+    }
+    
+    stepComManager();
+    
+    // extern int32_t PIOS_COM_SendBuffer(uint32_t com_id, const uint8_t *buffer, uint16_t len);
+    // extern uint16_t PIOS_COM_ReceiveBuffer(uint32_t com_id, uint8_t *buf, uint16_t buf_len, uint32_t timeout_ms);
+    // uint16_t cnt = PIOS_COM_ReceiveBuffer(PIOS_COM_IS, buffer, sizeof(buffer) / sizeof(buffer[0]), 20);
+}
+
+#endif
+
 /**
  * @}
  * @}

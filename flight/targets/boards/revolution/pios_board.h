@@ -158,6 +158,11 @@ extern uint32_t pios_com_msp_id;
 #define PIOS_COM_OSDHK     (pios_com_hkosd_id)
 #define PIOS_COM_MSP       (pios_com_msp_id)
 
+#if PIOS_INCLUDE_IS
+extern uint32_t pios_com_is_id;
+#define PIOS_COM_IS        (pios_com_is_id)
+#endif
+
 #if defined(PIOS_INCLUDE_DEBUG_CONSOLE)
 extern uint32_t pios_com_debug_id;
 #define PIOS_COM_DEBUG     (pios_com_debug_id)
