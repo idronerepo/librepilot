@@ -31,6 +31,9 @@ USE_CXX = YES
 # ARM DSP library
 USE_DSP_LIB ?= NO
 
+# Inertial sense support?
+USE_INERTIAL_SENSE = YES
+
 # List of mandatory modules to include
 MODULES += Sensors
 MODULES += StateEstimation
@@ -51,7 +54,6 @@ MODULES += Osd/osdoutout
 MODULES += Logging
 MODULES += Telemetry
 MODULES += Notify
-
 OPTMODULES += AutoTune
 OPTMODULES += ComUsbBridge
 OPTMODULES += UAVOMSPBridge
@@ -63,6 +65,13 @@ CDEFS += -DUSE_INPUT_LPF -DUSE_GIMBAL_LPF -DUSE_GIMBAL_FF
 
 # Some diagnostics
 CDEFS += -DDIAG_TASKS
+
+ifeq ($(USE_INERTIAL_SENSE), YES)
+
+CDEFS += -DPIOS_INCLUDE_IS=1
+EXTRAINCDIRS += $(FLIGHTLIB)/inertialsense
+
+endif
 
 # Misc options
 CFLAGS += -ffast-math
@@ -101,6 +110,15 @@ ifndef TESTAPP
     ## UAVObjects
     include ./UAVObjects.inc
     SRC += $(UAVOBJSRC)
+
+    ifeq ($(USE_INERTIAL_SENSE), YES)
+
+    SRC += $(FLIGHTLIB)/inertialsense/com_manager.c
+    SRC += $(FLIGHTLIB)/inertialsense/data_sets.c
+    SRC += $(FLIGHTLIB)/inertialsense/linked_list.c
+
+    endif
+
 else
     ## Test Code
     SRC += $(OPTESTS)/test_common.c
