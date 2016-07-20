@@ -97,4 +97,7 @@ int32_t filterEKF13Initialize(stateFilter *handle);
 int32_t filterEKF16iInitialize(stateFilter *handle);
 int32_t filterEKF16Initialize(stateFilter *handle);
 
+// is there a current filter in the settings?
+unsigned char StateEstimationEnabled();
+
 #endif // STATEESTIMATION_H
