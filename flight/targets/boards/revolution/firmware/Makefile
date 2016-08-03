@@ -34,6 +34,18 @@ USE_DSP_LIB ?= NO
 # Inertial sense support?
 USE_INERTIAL_SENSE = YES
 
+ifeq ($(USE_INERTIAL_SENSE), YES)
+
+CDEFS += -DPIOS_INCLUDE_IS=1
+
+# configure state estimation via Settings -> RevoSettings -> FusionAlgorithm
+# set fusion algorithm to none to use uINS state estimation
+# set fusion algorithm to something other than none to use librepilot state estimation
+
+EXTRAINCDIRS += $(FLIGHTLIB)/inertialsense
+
+endif
+
 # List of mandatory modules to include
 MODULES += Sensors
 MODULES += StateEstimation
@@ -54,6 +66,7 @@ MODULES += Osd/osdoutout
 MODULES += Logging
 MODULES += Telemetry
 MODULES += Notify
+
 OPTMODULES += AutoTune
 OPTMODULES += ComUsbBridge
 OPTMODULES += UAVOMSPBridge
@@ -66,13 +79,6 @@ CDEFS += -DUSE_INPUT_LPF -DUSE_GIMBAL_LPF -DUSE_GIMBAL_FF
 
 # Some diagnostics
 CDEFS += -DDIAG_TASKS
-
-ifeq ($(USE_INERTIAL_SENSE), YES)
-
-CDEFS += -DPIOS_INCLUDE_IS=1
-EXTRAINCDIRS += $(FLIGHTLIB)/inertialsense
-
-endif
 
 # Misc options
 CFLAGS += -ffast-math

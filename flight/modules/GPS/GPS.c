@@ -82,7 +82,6 @@ static void gpsTask(__attribute__((unused)) void *parameters);
 static void updateHwSettings(__attribute__((unused)) UAVObjEvent *ev);
 
 #if defined(PIOS_GPS_SETS_HOMELOCATION)
-static void setHomeLocation(GPSPositionSensorData *gpsData);
 static float GravityAccel(float latitude, float longitude, float altitude);
 #endif
 
@@ -467,7 +466,7 @@ static float GravityAccel(float latitude, __attribute__((unused)) float longitud
 
 // ****************
 
-static void setHomeLocation(GPSPositionSensorData *gpsData)
+void setHomeLocation(GPSPositionSensorData *gpsData)
 {
     HomeLocationData home;
 

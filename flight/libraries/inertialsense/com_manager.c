@@ -1205,7 +1205,7 @@ int processBinaryRxPacket(com_manager_t* cmInstance, int pHandle, packet_t *pkt,
 			}
 
 			// Update Rx data size
-			dataHdr->size = min(dataHdr->size, (uint8_t)size);
+			dataHdr->size = _MIN(dataHdr->size, (uint8_t)size);
 		}
 
 #if ENABLE_PACKET_CONTINUATION
@@ -1339,7 +1339,7 @@ int processDataRequest(com_manager_t* cmInstance, int pHandle, p_data_get_t *req
 	// Constrain request broadcast period if necessary
 	if (req->bc_period_ms != 0)
 	{
-		LIMIT2(req->bc_period_ms, MIN_REQUEST_PERIOD_MS, MAX_REQUEST_PERIOD_MS);
+		_LIMIT2(req->bc_period_ms, MIN_REQUEST_PERIOD_MS, MAX_REQUEST_PERIOD_MS);
 	}
 
 	// if size is 0 and offset is 0, set size to full data struct size
@@ -1592,7 +1592,7 @@ int sendDataPacket(com_manager_t* cmInstance, int pHandle, pkt_info_t *msg)
 		while (size > 0)
 		{
 			// Populate data structure
-			data.hdr.size = min(size, MAX_P_DATA_BODY_SIZE);
+			data.hdr.size = _MIN(size, MAX_P_DATA_BODY_SIZE);
 			memcpy(data.buf, msg->txData.ptr + offset, data.hdr.size);
 			size -= data.hdr.size;
 			offset += data.hdr.size;

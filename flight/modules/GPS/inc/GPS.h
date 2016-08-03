@@ -57,6 +57,12 @@ int32_t GPSInitialize(void);
 void gps_set_fc_baud_from_arg(uint8_t baud);
 uint32_t hwsettings_gpsspeed_enum_to_baud(uint8_t baud);
 
+#if defined(PIOS_GPS_SETS_HOMELOCATION)
+
+void setHomeLocation(GPSPositionSensorData *gpsData);
+
+#endif
+
 #endif // GPS_H
 
 /**

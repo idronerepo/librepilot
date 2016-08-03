@@ -36,22 +36,16 @@ extern "C" {
 #endif
 */
 
-#ifndef max 
-
-#define max(a,b) (((a) > (b)) ? (a) : (b))
-
+#ifndef _MAX 
+#define _MAX(a,b) (((a) > (b)) ? (a) : (b))
 #endif
 
-#ifndef min
-
-#define min(a,b) (((a) < (b)) ? (a) : (b))
-
+#ifndef _MIN
+#define _MIN(a,b) (((a) < (b)) ? (a) : (b))
 #endif
 
-#ifndef LIMIT2
-
-#define LIMIT2(x, xmin, xmax) { if ((x) < (xmin)) { (x) = (xmin); } else if ((x) > (xmax)) { (x) = (xmax); } }
-
+#ifndef _LIMIT2
+#define _LIMIT2(x, xmin, xmax) { if ((x) < (xmin)) { (x) = (xmin); } else if ((x) > (xmax)) { (x) = (xmax); } }
 #endif
 
 /*! The maximum allowable dataset size */

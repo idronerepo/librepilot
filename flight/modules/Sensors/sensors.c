@@ -76,7 +76,17 @@
 
 // Private constants
 
+#if PIOS_INCLUDE_IS
+
+// larger stack size needed for communications between uINS and librepilot
+#define STACK_SIZE_BYTES         4096
+
+#else
+
 #define STACK_SIZE_BYTES         1024
+
+#endif
+
 #define TASK_PRIORITY            (tskIDLE_PRIORITY + 3)
 
 #define MAX_SENSORS_PER_INSTANCE 2
@@ -163,6 +173,7 @@ static void updateBaroTempBias(float temperature);
 #if PIOS_INCLUDE_IS
 
 static void processSensorsInertialSense(void);
+static void processErrorInertialSense();
 
 #endif
 
@@ -211,26 +222,32 @@ static bool useAuxMag = false;
 // this should be defined in the firmware makefile, i.e. flight/targets/boards/revolution/firmware (USE_INERTIAL_SENSE = YES)
 #if PIOS_INCLUDE_IS
 
-#include "com_manager.h"
-#include "data_sets.h"
+#define FREQUENCY_INS 200 // hz
+#define PERIOD_INS (1000 / FREQUENCY_INS)
+#define TICK_TIMEOUT_INS (PERIOD_INS * 20)
+static uint16_t uINSTickCounterINS = 0;
+
+#define FREQUENCY_IMU 200 // hz
+#define PERIOD_IMU (1000 / FREQUENCY_IMU)
+#define TICK_TIMEOUT_IMU (PERIOD_IMU * 20)
+static uint16_t uINSTickCounterIMU = 0;
+
+#define FREQUENCY_GPS 5 // hz
+#define PERIOD_GPS (1000 / FREQUENCY_GPS)
+#define TICK_TIMEOUT_GPS (PERIOD_GPS * 20)
+static uint16_t uINSTickCounterGPS = 0;
+
+#include <com_manager.h>
+#include <data_sets.h>
+#include <stateestimation.h>
+#include <attitudestate.h>
+#include <positionstate.h>
+#include <velocitystate.h>
 
 #ifdef PIOS_GPS_SETS_HOMELOCATION
 
-#include "GPS.h"
-#include "WorldMagModel.h"
-
-static float GravityAccel(float latitude, __attribute__((unused)) float longitude, float altitude)
-{
-    /* WGS84 gravity model.  The effect of gravity over latitude is strong
-     * enough to change the estimated accelerometer bias in those apps. */
-    float sinsq = sinf(latitude);
-    
-    sinsq *= sinsq;
-    /* Likewise, over the altitude range of a high-altitude balloon, the effect
-     * due to change in altitude can also affect the model. */
-    return 9.7803267714f * (1.0f + 0.00193185138639f * sinsq) / sqrtf(1.0f - 0.00669437999013f * sinsq)
-    - 3.086e-6f * altitude;
-}
+#include <GPS.h>
+#include <gpssettings.h>
 
 #endif
 
@@ -252,87 +269,210 @@ static int readInertialSensePacket(CMHANDLE cmHandle, int pHandle, unsigned char
     return PIOS_COM_ReceiveBuffer(PIOS_COM_IS, buf, len, 20);
 }
 
+static void requestDataFromuINS()
+{
+	// Turn off any existing broadcast messages (on all serial ports)
+	sendComManager(0, PID_STOP_ALL_BROADCASTS, 0, 0, 0);
+
+	if (StateEstimationEnabled())
+	{
+		// request uINS system sensors (sys_sensors_t)
+		getDataComManager(0, DID_SYS_SENSORS, 0, 0, PERIOD_IMU);
+
+		// request uINS GPS data (gps_t)
+		getDataComManager(0, DID_GPS, 0, 0, PERIOD_GPS);
+	}
+	else
+	{
+		// request uINS INS data (ins_2_t)
+		getDataComManager(0, DID_INS_2, 0, 0, PERIOD_INS);
+	}
+}
+
+#define DEG2RAD_EARTH_RADIUS_F		111120.0f					// = DEG2RAD * earth_radius_in_meters
+#define C_DEG2RAD_F					0.017453292519943295769236907684886f
+#define _DEG2RAD					C_DEG2RAD_F
+#define UNWRAP_DEG_F(x)				{while( (x) > (180.0f) ) (x) -= (360.0f);    while( (x) < (-180.0f) ) (x) += (360.0f);}	    // unwrap to +- 180
+
+#define _SIN        sinf
+#define _COS        cosf
+#define _TAN        tanf
+#define _ASIN       asinf
+#define _ACOS       acosf
+#define _ATAN2      atan2f
+
+typedef double      Vector3d[3];    // V = | 0 1 2 |
+typedef float       f_t;
+typedef f_t         Vector3[3];     // V = | 0 1 2 |
+
+/*
+*  Find NED (north, east, down) from LLAref to LLA (WGS-84 standard)
+*
+*  lla[0] = latitude (decimal degree)
+*  lla[1] = longitude (decimal degree)
+*  lla[2] = msl altitude (m)
+*/
+void lla2ned_d(Vector3d llaRef, Vector3d lla, Vector3 result)
+{
+	Vector3 deltaLLA;
+	deltaLLA[0] = (f_t)(lla[0] - llaRef[0]);
+	deltaLLA[1] = (f_t)(lla[1] - llaRef[1]);
+	deltaLLA[2] = (f_t)(lla[2] - llaRef[2]);
+
+	// Handle longitude wrapping 
+	UNWRAP_DEG_F(deltaLLA[1]);
+
+	// Find NED
+	result[0] = deltaLLA[0] * DEG2RAD_EARTH_RADIUS_F;
+	result[1] = deltaLLA[1] * DEG2RAD_EARTH_RADIUS_F * _COS(((f_t)llaRef[0]) * _DEG2RAD);
+	result[2] = -deltaLLA[2];
+}
+
+static void handleInertialSenseINS(ins_2_t* ins)
+{
+	AlarmsClear(SYSTEMALARMS_ALARM_ATTITUDE);
+	AlarmsClear(SYSTEMALARMS_ALARM_MAGNETOMETER);
+	AlarmsClear(SYSTEMALARMS_ALARM_SENSORS);
+	uINSTickCounterINS = 0;
+	AttitudeStateData a;
+	AttitudeStateGet(&a);
+	a.q1 = ins->q[0];
+	a.q2 = ins->q[1];
+	a.q3 = ins->q[2];
+	a.q4 = ins->q[3];
+	Quaternion2RPY(&a.q1, &a.Roll);
+	AttitudeStateSet(&a);
+	VelocityStateData v;
+	VelocityStateGet(&v);
+	// Rotate body velocities into NED frame
+	float Rot[3][3];
+	Quaternion2R(ins->q, Rot);
+	rot_mult(Rot, ins->uvw, &v.North);
+	VelocityStateSet(&v);
+
+	PositionStateData p;
+	PositionStateGet(&p);
+	HomeLocationData home;
+	HomeLocationGet(&home);
+
+	double homeLla[3] = { home.Latitude, home.Longitude, home.Altitude };
+	lla2ned_d(homeLla, ins->lla, &p.North);
+	PositionStateSet(&p);
+
+	if (ins->iStatus & INS_STATUS_POS_ALIGNED_COARSE)
+	{
+		AlarmsClear(SYSTEMALARMS_ALARM_GPS);
+		uINSTickCounterGPS = 0;
+	}
+}
+
+static void handleInertialSenseGPS(gps_t* gps)
+{
+
+#define GPS_HOMELOCATION_SET_DELAY 5000
+
+	static portTickType homelocationSetDelay = 0;
+
+	GPSPositionSensorData gpsPosition;
+	GPSPositionSensorGet(&gpsPosition);
+	gpsPosition.Latitude = gps->pos.lla[0];
+	gpsPosition.Longitude = gps->pos.lla[1];
+	gpsPosition.Altitude = gps->pos.lla[2];
+	gpsPosition.Groundspeed = gps->vel.s2D;
+	gpsPosition.Heading = gps->vel.course;
+	gpsPosition.Satellites = gps->pos.status & GPS_STATUS_NUM_SATS_USED_MASK;
+	gpsPosition.PDOP = gps->pos.pDop;
+	GPSPositionSensorSet(&gpsPosition);
+
+	GPSVelocitySensorData gpsVelocity;
+	GPSVelocitySensorGet(&gpsVelocity);
+	gpsVelocity.North = gps->vel.ned[0];
+	gpsVelocity.East = gps->vel.ned[1];
+	gpsVelocity.Down = gps->vel.ned[2];
+	GPSVelocitySensorSet(&gpsVelocity);
+	uint8_t status;
+	GPSPositionSensorStatusGet(&status);
+	switch (gps->pos.status&GPS_STATUS_FIX_TYPE_MASK)
+	{
+	default:							status = GPSPOSITIONSENSOR_STATUS_NOFIX;	break;
+	case GPS_STATUS_FIX_TYPE_2D_FIX:	status = GPSPOSITIONSENSOR_STATUS_FIX2D;	break;
+	case GPS_STATUS_FIX_TYPE_3D_FIX:	status = GPSPOSITIONSENSOR_STATUS_FIX3D;	break;
+	}
+	GPSPositionSensorStatusSet(&status);
+
+#ifdef PIOS_GPS_SETS_HOMELOCATION
+
+	GPSSettingsData gpsSettings;
+	GPSSettingsGet(&gpsSettings);
+	if ((gpsPosition.PDOP < gpsSettings.MaxPDOP) &&
+		(gpsPosition.Satellites >= gpsSettings.MinSatellites) &&
+		(gpsPosition.Status == GPSPOSITIONSENSOR_STATUS_FIX3D) &&
+		(gpsPosition.Latitude != 0 || gpsPosition.Longitude != 0)) {
+		HomeLocationData home;
+		HomeLocationGet(&home);
+		uINSTickCounterGPS = 0;
+		AlarmsClear(SYSTEMALARMS_ALARM_GPS);
+		if (home.Set == HOMELOCATION_SET_FALSE) {
+			if (homelocationSetDelay == 0) {
+				homelocationSetDelay = xTaskGetTickCount();
+			}
+			if (xTaskGetTickCount() - homelocationSetDelay > GPS_HOMELOCATION_SET_DELAY) {
+				setHomeLocation(&gpsPosition);
+				homelocationSetDelay = 0;
+			}
+		}
+		else {
+			homelocationSetDelay = 0;
+		}
+	}
+
+#endif
+
+}
+
+static void handleInertialSenseIMU(sys_sensors_t* sysSensors)
+{
+	AlarmsClear(SYSTEMALARMS_ALARM_MAGNETOMETER);
+	AlarmsClear(SYSTEMALARMS_ALARM_SENSORS);
+	uINSTickCounterIMU = 0;
+	{
+		AccelSensorData accelSensorData = { sysSensors->acc[0], sysSensors->acc[1], sysSensors->acc[2], sysSensors->temp };
+		AccelSensorSet(&accelSensorData);
+	}
+	{
+		GyroSensorData gyroSensorData = { RAD2DEG(sysSensors->pqr[0]), RAD2DEG(sysSensors->pqr[1]), RAD2DEG(sysSensors->pqr[2]), sysSensors->temp };
+		GyroSensorSet(&gyroSensorData);
+	}
+	{
+		MagSensorData magSensorData = { sysSensors->mag[0], sysSensors->mag[1], sysSensors->mag[2], sysSensors->temp };
+		MagSensorSet(&magSensorData);
+	}
+	{
+		BaroSensorData baroData = { sysSensors->mslBar, sysSensors->temp, sysSensors->bar };
+		BaroSensorSet(&baroData);
+	}
+}
+
 static void processInertialSensePacket(CMHANDLE cmHandle, int pHandle, p_data_t* data)
 {
     (void)pHandle;
     (void)cmHandle;
-    (void)data;
-    
-    if (data->hdr.id == DID_GPS)
-    {
-        
-#ifdef PIOS_GPS_SETS_HOMELOCATION
-        
-        gps_t* gps = (gps_t*)data;
-        
-#ifdef PIOS_GPS_SETS_HOMELOCATION
-        
-        // TODO: this really fouls things up, need to figure out what is going on
-        //        gps_t* gps = (gps_t*)data;
-        
-        //        int32_t lat = gps->pos.lla[0] * 1000000;
-        //        int32_t lon = gps->pos.lla[1] * 1000000;
-        //        float alt = gps->pos.lla[2];
-        
-        //        HomeLocationLatitudeSet(&lat);
-        //        HomeLocationLongitudeSet(&lon);
-        //        HomeLocationAltitudeSet(&alt);
-        
-#endif
-        
-        /* Store LLA */
-        HomeLocationData home;
-        HomeLocationGet(&home);
-        home.Latitude  = (float)gps->pos.lla[0];
-        home.Longitude = (float)gps->pos.lla[1];
-        home.Altitude  = (float)gps->pos.lla[2] + (float)gps->pos.hMSL;
-        
-        /* Compute home ECEF coordinates and the rotation matrix into NED
-         * Note that floats are used here - they should give enough precision
-         * for this application.*/
-        
-        float LLA[3] = { (home.Latitude) / 10e6f, (home.Longitude) / 10e6f, (home.Altitude) };
 
-        // TODO: Need month, day and year from uINS
-        
-        /* Compute magnetic flux direction at home location */
-        if (WMM_GetMagVector(LLA[0], LLA[1], LLA[2], 7, 4, 2016, &home.Be[0]) == 0)
-        {
-            /*Compute local acceleration due to gravity.  Vehicles that span a very large
-             * range of altitude (say, weather balloons) may need to update this during the flight. */
-            home.g_e = GravityAccel(LLA[0], LLA[1], LLA[2]);
-            home.Set = HOMELOCATION_SET_TRUE;
-//            HomeLocationSet(&home);
-        }
-        
-#endif
-        
-    }
-    else if (data->hdr.id == DID_SYS_SENSORS)
-    {
-        sys_sensors_t* sysSensors = (sys_sensors_t*)data->buf;
-        {
-            AccelSensorData accelSensorData = { sysSensors->acc[0], sysSensors->acc[1], sysSensors->acc[2], sysSensors->temp };
-            AccelSensorSet(&accelSensorData);
-        }
-        {
-            GyroSensorData gyroSensorData = { RAD2DEG(sysSensors->pqr[0]), RAD2DEG(sysSensors->pqr[1]), RAD2DEG(sysSensors->pqr[2]), sysSensors->temp };
-            GyroSensorSet(&gyroSensorData);
-        }
-        {
-            MagSensorData magSensorData = { sysSensors->mag[0], sysSensors->mag[1], sysSensors->mag[2], sysSensors->temp };
-            MagSensorSet(&magSensorData);
-        }
-        {
-            float altitude = 44330.0f * (1.0f - powf((sysSensors->bar) / PIOS_CONST_MKS_STD_ATMOSPHERE_F, (1.0f / 5.255f)));
-            
-            if (!isnan(altitude))
-            {
-                BaroSensorData baroData = { altitude, sysSensors->temp, sysSensors->bar };
-                BaroSensorSet(&baroData);
-            }
-        }
-    }
+	if (StateEstimationEnabled())
+	{
+		if (data->hdr.id == DID_SYS_SENSORS)
+		{
+			handleInertialSenseIMU((sys_sensors_t*)data->buf);
+		}
+		else if (data->hdr.id == DID_GPS)
+		{
+			handleInertialSenseGPS((gps_t*)data->buf);
+		}
+	}
+	else if (data->hdr.id == DID_INS_2)
+	{
+		handleInertialSenseINS((ins_2_t*)data->buf);
+	}
 }
 
 #endif
@@ -412,23 +552,35 @@ static void SensorsTask(__attribute__((unused)) void *parameters)
     PERF_INIT_COUNTER(counterSensorPeriod, 0x53000005);
     PERF_INIT_COUNTER(counterSensorResets, 0x53000006);
 
-    // Test sensors
-    bool sensors_test = true;
-    uint8_t count     = 0;
-    LL_FOREACH((PIOS_SENSORS_Instance *)sensors_list, sensor) {
-        RELOAD_WDG(); // mag tests on I2C have 200+(7x10)ms delay calls in them
-        sensors_test &= PIOS_SENSORS_Test(sensor);
-        count++;
-    }
+#if PIOS_INCLUDE_IS
 
-    PIOS_Assert(count);
-    RELOAD_WDG();
-    if (!sensors_test) {
-        AlarmsSet(SYSTEMALARMS_ALARM_SENSORS, SYSTEMALARMS_ALARM_CRITICAL);
-        while (1) {
-            vTaskDelay(10);
-        }
-    }
+	if (!PIOS_COM_IS) {
+
+#endif
+
+		// Test sensors
+		bool sensors_test = true;
+		uint8_t count     = 0;
+		LL_FOREACH((PIOS_SENSORS_Instance *)sensors_list, sensor) {
+			RELOAD_WDG(); // mag tests on I2C have 200+(7x10)ms delay calls in them
+			sensors_test &= PIOS_SENSORS_Test(sensor);
+			count++;
+		}
+
+		PIOS_Assert(count);
+		RELOAD_WDG();
+		if (!sensors_test) {
+			AlarmsSet(SYSTEMALARMS_ALARM_SENSORS, SYSTEMALARMS_ALARM_CRITICAL);
+			while (1) {
+				vTaskDelay(10);
+			}
+		}
+
+#if PIOS_INCLUDE_IS
+
+	}
+
+#endif
 
     // Main task loop
     lastSysTime = xTaskGetTickCount();
@@ -436,36 +588,44 @@ static void SensorsTask(__attribute__((unused)) void *parameters)
 
     while (1) {
         
-        // TODO: add timeouts to the sensor reads and set an error if the fail
-        if (error)
-        {
-            RELOAD_WDG();
-            lastSysTime = xTaskGetTickCount();
-            vTaskDelayUntil(&lastSysTime, sensor_period_ticks);
-            AlarmsSet(SYSTEMALARMS_ALARM_SENSORS, SYSTEMALARMS_ALARM_CRITICAL);
-            error = false;
-        }
-        else
-        {
-            AlarmsClear(SYSTEMALARMS_ALARM_SENSORS);
-        }
+#if PIOS_INCLUDE_IS
+
+		if (!PIOS_COM_IS) {
+
+#endif
+
+			if (error) {
+				RELOAD_WDG();
+				lastSysTime = xTaskGetTickCount();
+				vTaskDelayUntil(&lastSysTime, sensor_period_ticks);
+				AlarmsSet(SYSTEMALARMS_ALARM_SENSORS, SYSTEMALARMS_ALARM_CRITICAL);
+				error = false;
+			}
+			else {
+				AlarmsClear(SYSTEMALARMS_ALARM_SENSORS);
+			}
+
+#if PIOS_INCLUDE_IS
+
+		}
         
+#endif
+
         // reset the fetch context
         clearContext(&sensor_context);
 
 #if PIOS_INCLUDE_IS
         
-        if (PIOS_COM_IS)
-        {
+        if (PIOS_COM_IS) {
             processSensorsInertialSense();
+			processErrorInertialSense();
         }
         else
         {
-            
+
 #endif
 
-            LL_FOREACH((PIOS_SENSORS_Instance *)sensors_list, sensor)
-            {
+            LL_FOREACH((PIOS_SENSORS_Instance *)sensors_list, sensor) {
                 // we will wait on the sensor that's marked as primary( that means the sensor with higher sample rate)
                 bool is_primary = (sensor->type & PIOS_SENSORS_TYPE_3AXIS_ACCEL);
 
@@ -824,31 +984,84 @@ void aux_hmc5x83_load_mag_settings()
 
 static void processSensorsInertialSense(void)
 {
-    static char isInitialized = 0;
-    
-    if (!isInitialized)
-    {
-        // initialize Inertial Sense
-        isInitialized = 1;
-        
-        // set baud rate
-        PIOS_COM_ChangeBaud(PIOS_COM_IS, 115200);
-        
-        // setup com manager
-        initComManager(1, 0, sensor_period_ticks, 0, readInertialSensePacket, writeInertialSensePacket, 0, processInertialSensePacket, 0, 0);
-        
-        // request device info 10 time a second (sys_sensors_t)
-        getDataComManager(0, DID_SYS_SENSORS, 0, 0, 100);
-    
-        // request gps data 5 times a second (gps_nav_poslla_t)
-        getDataComManager(0, DID_GPS, 0, 0, 200);
-    }
-    
+	static char isUInsInitialized = 0;
+
+	if (!isUInsInitialized)
+	{
+		// initialize Inertial Sense
+		isUInsInitialized = 1;
+
+		// 230400 is the highest configurable baud rate in the gcs software, but 460800 also works
+		// values higher than 460800 do not work
+		PIOS_COM_ChangeBaud(PIOS_COM_IS, 460800);
+
+		// setup com manager
+		initComManager(1, 0, sensor_period_ticks, 0, readInertialSensePacket, writeInertialSensePacket, 0, processInertialSensePacket, 0, 0);
+
+		// request data immediately and assume the uINS is already connected
+		requestDataFromuINS();
+
+		// Set debug
+// #define DID_DEBUG_ARRAY			39			// (39 debug_array_t)
+// 		uint32_t i = sensor_period_ticks;
+// 		sendDataComManager(0, DID_DEBUG_ARRAY, &i, 4, 0);
+
+	}
+
+	// increment error counters - these are reset to 0 when valid data from the uINS is received
+
+	if (StateEstimationEnabled())
+	{
+		uINSTickCounterIMU += sensor_period_ticks;
+	}
+	else
+	{
+		uINSTickCounterINS += sensor_period_ticks;
+	}
+	uINSTickCounterGPS += sensor_period_ticks;
+
     stepComManager();
     
+	// serial port function prototypes for reference
     // extern int32_t PIOS_COM_SendBuffer(uint32_t com_id, const uint8_t *buffer, uint16_t len);
     // extern uint16_t PIOS_COM_ReceiveBuffer(uint32_t com_id, uint8_t *buf, uint16_t buf_len, uint32_t timeout_ms);
     // uint16_t cnt = PIOS_COM_ReceiveBuffer(PIOS_COM_IS, buffer, sizeof(buffer) / sizeof(buffer[0]), 20);
+}
+
+static void processErrorInertialSense()
+{
+	if (StateEstimationEnabled())
+	{
+		if (uINSTickCounterIMU > TICK_TIMEOUT_IMU)
+		{
+			AlarmsSet(SYSTEMALARMS_ALARM_MAGNETOMETER, SYSTEMALARMS_ALARM_CRITICAL);
+			AlarmsSet(SYSTEMALARMS_ALARM_SENSORS, SYSTEMALARMS_ALARM_CRITICAL);
+
+			// request uINS system sensors (sys_sensors_t)
+			getDataComManager(0, DID_SYS_SENSORS, 0, 0, PERIOD_IMU);
+		}
+	}
+	else if (uINSTickCounterINS > TICK_TIMEOUT_INS)
+	{
+		AlarmsSet(SYSTEMALARMS_ALARM_ATTITUDE, SYSTEMALARMS_ALARM_CRITICAL);
+		AlarmsSet(SYSTEMALARMS_ALARM_MAGNETOMETER, SYSTEMALARMS_ALARM_CRITICAL);
+		AlarmsSet(SYSTEMALARMS_ALARM_SENSORS, SYSTEMALARMS_ALARM_CRITICAL);
+
+		// request uINS INS data (ins_2_t)
+		getDataComManager(0, DID_INS_2, 0, 0, PERIOD_INS);
+	}
+
+	// always check GPS regardless of whether state estimation is enabled
+	if (uINSTickCounterGPS > TICK_TIMEOUT_GPS)
+	{
+		AlarmsSet(SYSTEMALARMS_ALARM_GPS, SYSTEMALARMS_ALARM_CRITICAL);
+
+		if (!StateEstimationEnabled())
+		{
+			// request uINS GPS data (gps_t)
+			getDataComManager(0, DID_GPS, 0, 0, PERIOD_GPS);
+		}
+	}
 }
 
 #endif
